@@ -49,9 +49,9 @@ static const char *TAG = "LAB_MAIN";
 
 /* 5. Progressive Lab Step Toggles (Set to 1 to enable, 0 to skip) */
 #define LAB_ENABLE_STEP_1_SCAN      1   /* Module 1: 802.11 AP Scan */
-#define LAB_ENABLE_STEP_2_CONNECT   1   /* Module 2: Station Connect + DHCP */
-#define LAB_ENABLE_STEP_3_GET_API   1   /* Module 3: HTTP GET Weather API */
-#define LAB_ENABLE_STEP_4_POST_API  1   /* Module 4: HTTP POST FastAPI Enrollment */
+#define LAB_ENABLE_STEP_2_CONNECT   0   /* Module 2: Station Connect + DHCP */
+#define LAB_ENABLE_STEP_3_GET_API   0   /* Module 3: HTTP GET Weather API */
+#define LAB_ENABLE_STEP_4_POST_API  0   /* Module 4: HTTP POST FastAPI Enrollment */
 
 /* ============================================================================
  * APPLICATION ENTRY POINT
