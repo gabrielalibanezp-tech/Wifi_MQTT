@@ -39,12 +39,19 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "mqtt_client.h"
 #include "cJSON.h"
 
 static const char *TAG = "MQTT_LAB";
+
+/* Keep-alive corto para que el broker detecte la desconexión en ~15 s
+ * (el broker publica el LWT tras 1.5 x keepalive sin PINGREQ).
+ * El valor por defecto de esp-mqtt es 120 s (~3 minutos para ver el LWT). */
+#define LAB_MQTT_KEEPALIVE_SEC  10
 
 /* Global MQTT Client Handle & State */
 static esp_mqtt_client_handle_t s_mqtt_client = NULL;
@@ -102,30 +109,58 @@ static void mqtt_process_incoming_command(const char *topic, const char *payload
 {
     ESP_LOGI(TAG, "Processing command on [%s]: %s", topic, payload);
 
-    /* ------------------------------------------------------------------------
-     * TODO (Task 4): Parse `payload` using cJSON and execute the command!
-     *
-     * Steps to implement:
-     *   1. Parse `payload` into `cJSON *root = cJSON_Parse(payload);`.
-     *      If `root == NULL`, log an error and return immediately.
-     *   2. Extract the `"action"` field using:
-     *      `cJSON *action = cJSON_GetObjectItemCaseSensitive(root, "action");`
-     *      Validate it with `cJSON_IsString(action) && action->valuestring != NULL`.
-     *   3. Check which action was requested (`strcmp`):
-     *      - If `"set_interval"`:
-     *          Extract `"value"` (`cJSON_GetObjectItemCaseSensitive(root, "value")`).
-     *          Verify `cJSON_IsNumber(val)` and `val->valueint >= 1 && val->valueint <= 60`.
-     *          Update `s_telemetry_interval_sec = (uint32_t)val->valueint;`
-     *          Publish an ACK string (e.g., `{"status":"interval_updated"}`) to `s_topic_status`.
-     *      - If `"ping"`:
-     *          Publish `{"status":"pong"}` to `s_topic_status` using `esp_mqtt_client_publish()`.
-     *      - If `"reboot"`:
-     *          Publish `{"status":"rebooting"}` and call `esp_restart()`.
-     *   4. ALWAYS call `cJSON_Delete(root)` before returning!
-     * ------------------------------------------------------------------------ */
-
     /* --- STUDENT CODE START (Task 4) --- */
-    ESP_LOGW(TAG, "TODO (Task 4): Implement mqtt_process_incoming_command() in mqtt_lab.c!");
+    /* 1. Parsear el JSON recibido */
+    cJSON *root = cJSON_Parse(payload);
+    if (root == NULL) {
+        ESP_LOGE(TAG, "Comando con JSON invalido: %s", payload);
+        return;
+    }
+
+    /* 2. Extraer y validar el campo "action" */
+    cJSON *action = cJSON_GetObjectItemCaseSensitive(root, "action");
+    if (!cJSON_IsString(action) || action->valuestring == NULL) {
+        ESP_LOGE(TAG, "Falta el campo \"action\" o no es un string");
+        cJSON_Delete(root);
+        return;
+    }
+
+    /* 3. Ejecutar la accion solicitada */
+    if (strcmp(action->valuestring, "set_interval") == 0) {
+        cJSON *val = cJSON_GetObjectItemCaseSensitive(root, "value");
+        if (cJSON_IsNumber(val) && val->valueint >= 1 && val->valueint <= 60) {
+            s_telemetry_interval_sec = (uint32_t)val->valueint;
+
+            char ack[96];
+            snprintf(ack, sizeof(ack),
+                     "{\"status\":\"interval_updated\",\"interval_sec\":%lu}",
+                     (unsigned long)s_telemetry_interval_sec);
+            esp_mqtt_client_publish(s_mqtt_client, s_topic_status, ack, 0, 1, 0);
+            ESP_LOGI(TAG, "Intervalo de telemetria actualizado a %lu s",
+                     (unsigned long)s_telemetry_interval_sec);
+        } else {
+            ESP_LOGW(TAG, "set_interval: \"value\" debe ser un numero entre 1 y 60");
+            esp_mqtt_client_publish(s_mqtt_client, s_topic_status,
+                                    "{\"status\":\"error\",\"reason\":\"invalid_interval\"}", 0, 1, 0);
+        }
+    } else if (strcmp(action->valuestring, "ping") == 0) {
+        esp_mqtt_client_publish(s_mqtt_client, s_topic_status, "{\"status\":\"pong\"}", 0, 1, 0);
+        ESP_LOGI(TAG, "Ping recibido -> pong enviado");
+    } else if (strcmp(action->valuestring, "reboot") == 0) {
+        esp_mqtt_client_publish(s_mqtt_client, s_topic_status, "{\"status\":\"rebooting\"}", 0, 1, 0);
+        ESP_LOGW(TAG, "Reinicio solicitado por MQTT...");
+        cJSON_Delete(root);
+        vTaskDelay(pdMS_TO_TICKS(500)); /* Dar tiempo a que salga el mensaje */
+        esp_restart();
+        return; /* No se alcanza */
+    } else {
+        ESP_LOGW(TAG, "Accion desconocida: %s", action->valuestring);
+        esp_mqtt_client_publish(s_mqtt_client, s_topic_status,
+                                "{\"status\":\"error\",\"reason\":\"unknown_action\"}", 0, 1, 0);
+    }
+
+    /* 4. Liberar siempre el arbol JSON */
+    cJSON_Delete(root);
     /* --- STUDENT CODE END (Task 4) --- */
 }
 
@@ -137,27 +172,23 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 {
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
     esp_mqtt_client_handle_t client = event->client;
-    (void)client; /* Suppress unused warning until student completes Task 1 */
 
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED: Connected to Broker!");
             s_is_connected = true;
 
-            /* ----------------------------------------------------------------
-             * TODO (Task 1A): Subscribe to Command Topic & Publish Online Status
-             *
-             * Steps to implement:
-             *   1. Subscribe to `s_topic_cmd` with QoS 1 using:
-             *      `int msg_id = esp_mqtt_client_subscribe(client, s_topic_cmd, 1);`
-             *      Log the `msg_id` returned.
-             *   2. Publish a birth/status message `"{\"status\":\"online\"}"` to
-             *      `s_topic_status` with length `0` (auto-strlen), QoS `1`, and
-             *      `retain = 1` using `esp_mqtt_client_publish(client, topic, data, len, qos, retain)`.
-             * ---------------------------------------------------------------- */
-
             /* --- STUDENT CODE START (Task 1A) --- */
-            ESP_LOGW(TAG, "TODO (Task 1A): Subscribe to s_topic_cmd and publish online status!");
+            {
+                /* 1. Suscribirse al topic de comandos con QoS 1 */
+                int msg_id = esp_mqtt_client_subscribe(client, s_topic_cmd, 1);
+                ESP_LOGI(TAG, "Suscrito a %s (msg_id=%d)", s_topic_cmd, msg_id);
+
+                /* 2. Publicar mensaje de nacimiento "online" retenido (QoS 1, retain 1) */
+                msg_id = esp_mqtt_client_publish(client, s_topic_status,
+                                                 "{\"status\":\"online\"}", 0, 1, 1);
+                ESP_LOGI(TAG, "Estado online publicado en %s (msg_id=%d)", s_topic_status, msg_id);
+            }
             /* --- STUDENT CODE END (Task 1A) --- */
             break;
 
@@ -177,30 +208,18 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         case MQTT_EVENT_DATA:
             ESP_LOGI(TAG, "MQTT_EVENT_DATA received!");
 
-            /* ----------------------------------------------------------------
-             * TODO (Task 1B): Safely Extract Topic & Payload and Call Parser
-             *
-             * CRITICAL EMBEDDED C LESSON:
-             *   `event->topic` (length `event->topic_len`) and
-             *   `event->data`  (length `event->data_len`) are raw network pointers
-             *   that are NOT null-terminated (`'\0'`)!
-             *   Passing `event->data` directly to `printf("%s")` or `cJSON_Parse()`
-             *   will read past the buffer and crash or corrupt memory!
-             *
-             * Steps to implement:
-             *   1. Create local buffers:
-             *        `char topic_buf[128] = {0};`
-             *        `char data_buf[512]  = {0};`
-             *   2. Copy at most `sizeof(topic_buf) - 1` bytes from `event->topic`
-             *      using `memcpy()` or `snprintf(topic_buf, sizeof(topic_buf), "%.*s", event->topic_len, event->topic);`
-             *   3. Copy at most `sizeof(data_buf) - 1` bytes from `event->data`
-             *      and ensure `data_buf` is null-terminated.
-             *   4. Call `mqtt_process_incoming_command(topic_buf, data_buf);`
-             * ---------------------------------------------------------------- */
-
             /* --- STUDENT CODE START (Task 1B) --- */
-            ESP_LOGW(TAG, "TODO (Task 1B): Copy event->topic and event->data safely and call mqtt_process_incoming_command()!");
-            (void)mqtt_process_incoming_command;
+            {
+                /* event->topic y event->data NO terminan en '\0':
+                 * se copian a buffers locales acotados y terminados en '\0'. */
+                char topic_buf[128] = {0};
+                char data_buf[512]  = {0};
+
+                snprintf(topic_buf, sizeof(topic_buf), "%.*s", event->topic_len, event->topic);
+                snprintf(data_buf,  sizeof(data_buf),  "%.*s", event->data_len,  event->data);
+
+                mqtt_process_incoming_command(topic_buf, data_buf);
+            }
             /* --- STUDENT CODE END (Task 1B) --- */
             break;
 
@@ -227,30 +246,31 @@ esp_err_t mqtt_app_start_plaintext(void)
 
     ESP_LOGI(TAG, "Starting Plaintext MQTT Client -> %s", LAB_MQTT_BROKER_PLAIN_URI);
 
-    /* ------------------------------------------------------------------------
-     * TODO (Task 2): Configure and Start the Plaintext MQTT Client with LWT
-     *
-     * Steps to implement:
-     *   1. Declare and zero-initialize `esp_mqtt_client_config_t mqtt_cfg = {0};`
-     *   2. Set `.broker.address.uri = LAB_MQTT_BROKER_PLAIN_URI;`
-     *   3. Configure Last Will and Testament (LWT) inside `mqtt_cfg.session.last_will`:
-     *        - `.topic  = s_topic_status`
-     *        - `.msg    = "{\"status\":\"offline_unexpected\"}"`
-     *        - `.msg_len = 0` (0 tells esp-mqtt to use strlen automatically)
-     *        - `.qos    = 1`
-     *        - `.retain = 1`
-     *   4. Initialize the client:
-     *        `s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);`
-     *   5. Register the event handler:
-     *        `esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);`
-     *   6. Start the client:
-     *        `return esp_mqtt_client_start(s_mqtt_client);`
-     * ------------------------------------------------------------------------ */
-
     /* --- STUDENT CODE START (Task 2) --- */
-    (void)mqtt_event_handler;
-    ESP_LOGW(TAG, "TODO (Task 2): Implement mqtt_app_start_plaintext() in mqtt_lab.c!");
-    return ESP_ERR_NOT_SUPPORTED;
+    /* 1-2. Configuracion base con la URI del broker en texto plano */
+    esp_mqtt_client_config_t mqtt_cfg = {0};
+    mqtt_cfg.broker.address.uri = LAB_MQTT_BROKER_PLAIN_URI;
+    mqtt_cfg.session.keepalive  = LAB_MQTT_KEEPALIVE_SEC;
+
+    /* 3. Last Will and Testament (LWT) */
+    mqtt_cfg.session.last_will.topic   = s_topic_status;
+    mqtt_cfg.session.last_will.msg     = "{\"status\":\"offline_unexpected\"}";
+    mqtt_cfg.session.last_will.msg_len = 0; /* 0 = usar strlen */
+    mqtt_cfg.session.last_will.qos     = 1;
+    mqtt_cfg.session.last_will.retain  = 1;
+
+    /* 4. Inicializar el cliente */
+    s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    if (s_mqtt_client == NULL) {
+        ESP_LOGE(TAG, "esp_mqtt_client_init() fallo");
+        return ESP_FAIL;
+    }
+
+    /* 5. Registrar el manejador de eventos */
+    esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+
+    /* 6. Arrancar el cliente */
+    return esp_mqtt_client_start(s_mqtt_client);
     /* --- STUDENT CODE END (Task 2) --- */
 }
 
@@ -264,37 +284,38 @@ esp_err_t mqtt_publish_telemetry(int rssi_dbm, uint32_t uptime_sec, uint32_t fre
         return ESP_FAIL;
     }
 
-    /* ------------------------------------------------------------------------
-     * TODO (Task 3): Serialize Telemetry with cJSON and Publish to Broker
-     *
-     * Target JSON structure:
-     *   {
-     *     "student_id": "team_01_alice_bob",
-     *     "mac": "2805A5749288",
-     *     "rssi_dbm": -48,
-     *     "uptime_sec": 120,
-     *     "free_heap": 218400
-     *   }
-     *
-     * Steps to implement:
-     *   1. Create a cJSON object: `cJSON *root = cJSON_CreateObject();`
-     *   2. Add the 5 fields above using `cJSON_AddStringToObject()` and
-     *      `cJSON_AddNumberToObject()`.
-     *   3. Serialize to an unformatted string:
-     *      `char *json_str = cJSON_PrintUnformatted(root);`
-     *   4. Delete the cJSON tree immediately (`cJSON_Delete(root);`).
-     *   5. Publish `json_str` to `s_topic_telemetry` with QoS `1` and `retain = 0`:
-     *      `int msg_id = esp_mqtt_client_publish(s_mqtt_client, s_topic_telemetry, json_str, 0, 1, 0);`
-     *   6. Free `json_str` (`free(json_str);`) so you don't leak heap every 10 seconds!
-     *   7. Return `ESP_OK` if `msg_id >= 0`, else `ESP_FAIL`.
-     * ------------------------------------------------------------------------ */
-
     /* --- STUDENT CODE START (Task 3) --- */
-    (void)rssi_dbm;
-    (void)uptime_sec;
-    (void)free_heap;
-    ESP_LOGW(TAG, "TODO (Task 3): Implement mqtt_publish_telemetry() in mqtt_lab.c!");
-    return ESP_ERR_NOT_SUPPORTED;
+    /* 1. Crear el objeto JSON */
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) {
+        ESP_LOGE(TAG, "Sin memoria para crear el JSON de telemetria");
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* 2. Agregar los 5 campos */
+    cJSON_AddStringToObject(root, "student_id", LAB_STUDENT_ID);
+    cJSON_AddStringToObject(root, "mac",        s_mac_clean);
+    cJSON_AddNumberToObject(root, "rssi_dbm",   rssi_dbm);
+    cJSON_AddNumberToObject(root, "uptime_sec", uptime_sec);
+    cJSON_AddNumberToObject(root, "free_heap",  free_heap);
+
+    /* 3-4. Serializar y liberar el arbol */
+    char *json_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (json_str == NULL) {
+        ESP_LOGE(TAG, "Sin memoria para serializar el JSON de telemetria");
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* 5. Publicar con QoS 1, sin retain */
+    int msg_id = esp_mqtt_client_publish(s_mqtt_client, s_topic_telemetry, json_str, 0, 1, 0);
+    ESP_LOGI(TAG, "Telemetria -> %s (msg_id=%d)", json_str, msg_id);
+
+    /* 6. Liberar el string serializado */
+    free(json_str);
+
+    /* 7. Resultado */
+    return (msg_id >= 0) ? ESP_OK : ESP_FAIL;
     /* --- STUDENT CODE END (Task 3) --- */
 }
 
@@ -307,30 +328,37 @@ esp_err_t mqtt_app_start_tls(void)
 
     ESP_LOGI(TAG, "Starting Secure MQTTS (TLS) Client -> %s", LAB_MQTT_BROKER_TLS_URI);
 
-    /* ------------------------------------------------------------------------
-     * TODO (Task 5): Configure and Start the MQTTS Client with Root CA Verification
-     *
-     * Steps to implement:
-     *   1. First, make sure you pasted your team's OpenSSL `ca.crt` into
-     *      `LAB_CA_CERT_PEM` inside `main/lab_certificates.h`!
-     *   2. Declare `esp_mqtt_client_config_t mqtt_cfg = {0};`
-     *   3. Set `.broker.address.uri = LAB_MQTT_BROKER_TLS_URI;` (uses `mqtts://` port 8883).
-     *   4. Attach your Root CA public certificate for server verification:
-     *        `mqtt_cfg.broker.verification.certificate = LAB_CA_CERT_PEM;`
-     *   5. Configure the same Last Will and Testament (LWT) on `s_topic_status` as in Task 2.
-     *   6. (Optional Bonus - Mutual TLS / mTLS):
-     *        If testing mTLS, also set:
-     *        `mqtt_cfg.credentials.authentication.certificate = LAB_CLIENT_CERT_PEM;`
-     *        `mqtt_cfg.credentials.authentication.key         = LAB_CLIENT_KEY_PEM;`
-     *   7. Initialize `s_mqtt_client`, register `mqtt_event_handler`, and start the client!
-     * ------------------------------------------------------------------------ */
-
     /* --- STUDENT CODE START (Task 5) --- */
-    (void)LAB_CA_CERT_PEM;
+    /* Requiere haber pegado el ca.crt del equipo en LAB_CA_CERT_PEM (lab_certificates.h) */
+    esp_mqtt_client_config_t mqtt_cfg = {0};
+    mqtt_cfg.broker.address.uri = LAB_MQTT_BROKER_TLS_URI;
+    mqtt_cfg.session.keepalive  = LAB_MQTT_KEEPALIVE_SEC;
+
+    /* Certificado de la Root CA para verificar la identidad del broker */
+    mqtt_cfg.broker.verification.certificate = LAB_CA_CERT_PEM;
+
+    /* Mismo LWT que en la Tarea 2 */
+    mqtt_cfg.session.last_will.topic   = s_topic_status;
+    mqtt_cfg.session.last_will.msg     = "{\"status\":\"offline_unexpected\"}";
+    mqtt_cfg.session.last_will.msg_len = 0;
+    mqtt_cfg.session.last_will.qos     = 1;
+    mqtt_cfg.session.last_will.retain  = 1;
+
+    /* Bonus mTLS: descomentar solo si se generaron client.crt / client.key
+     * y se habilito require_certificate en mosquitto_tls.conf */
+    // mqtt_cfg.credentials.authentication.certificate = LAB_CLIENT_CERT_PEM;
+    // mqtt_cfg.credentials.authentication.key         = LAB_CLIENT_KEY_PEM;
     (void)LAB_CLIENT_CERT_PEM;
     (void)LAB_CLIENT_KEY_PEM;
-    ESP_LOGW(TAG, "TODO (Task 5): Implement mqtt_app_start_tls() in mqtt_lab.c!");
-    return ESP_ERR_NOT_SUPPORTED;
+
+    s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    if (s_mqtt_client == NULL) {
+        ESP_LOGE(TAG, "esp_mqtt_client_init() fallo (TLS)");
+        return ESP_FAIL;
+    }
+
+    esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    return esp_mqtt_client_start(s_mqtt_client);
     /* --- STUDENT CODE END (Task 5) --- */
 }
 
